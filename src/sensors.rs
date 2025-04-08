@@ -2,17 +2,16 @@ use defmt::*;
 use embassy_stm32::i2c::I2c;
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
 use embassy_stm32::mode::Async;
-use embassy_stm32::peripherals::USB;
-use embassy_stm32::usb::Driver;
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
-use embassy_time::{Timer, Delay, Duration};
-use embassy_usb::class::cdc_acm::CdcAcmClass;
-use embedded_hal::prelude::{_embedded_hal_blocking_i2c_Write, _embedded_hal_blocking_i2c_WriteRead};
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
+use embassy_sync::channel::Channel;
+use embassy_time::{Timer, Duration};
+use embedded_hal::prelude::{_embedded_hal_blocking_i2c_WriteRead};
 use {defmt_rtt as _, panic_probe as _};
+use crate::adxl375::*;
 use crate::lsm6dsox::*;
 use crate::registers::*;
-use crate::usb_serial::usb_print;
-use crate::usb_write;
+
+pub const SENSOR_CHANNEL_CAPACITY: usize = 8;
 
 pub const DEVID: u8 = 0x00;
 pub const RESET_CMD: u8 = 0x1E;
@@ -25,8 +24,33 @@ const LSM6DSOX_ADDRESS: u8 = 0x6A;  // LSM6DSOX when SA0 is low
 const IIS2MDCTR_ADDRESS: u8 = 0x1E;  // fixed since no SA0 pin
 const MS5611_ADDRESS: u8 = 0x77;  // when CSB is low
 
+// millisecond wait for sensor tasks
+const WAIT_TIME: u64 = 10;
+
+#[derive(Debug, Default, Clone)]
+pub struct AccelData{
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct GyroData{
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+pub static LSM_ACCEL_CHANNEL: Channel<CriticalSectionRawMutex, AccelData, 8> = Channel::new();
+pub static GYRO_CHANNEL: Channel<CriticalSectionRawMutex, GyroData, 8> = Channel::new();
+pub static ADXL375_1_CHANNEL: Channel<CriticalSectionRawMutex, AccelData, 8> = Channel::new();
+pub static ADXL375_2_CHANNEL: Channel<CriticalSectionRawMutex, AccelData, 8> = Channel::new();
+
+
 #[embassy_executor::task]
-pub async fn lsm6dsox_task(mut i2c: I2cDevice<'static, NoopRawMutex, I2c<'static,  Async>>, class: &'static mut CdcAcmClass<'static, Driver<'static, USB>>,) {
+pub async fn lsm6dsox_task(
+    mut i2c: I2cDevice<'static, NoopRawMutex, I2c<'static,  Async>>,
+) {
     // Set up sensor (accelerometer and gyroscope configuration) before the loop
     setup_lsm6dsox(&mut i2c).await;
 
@@ -60,13 +84,19 @@ pub async fn lsm6dsox_task(mut i2c: I2cDevice<'static, NoopRawMutex, I2c<'static
 
                 // Convert raw accelerometer data to engineering units (e.g., m/s²)
                 let scale = accel_scale.to_factor();
-                let x_m_s2 = x_raw * scale;
-                let y_m_s2 = y_raw * scale;
-                let z_m_s2 = z_raw * scale;
+                let x_g = x_raw * scale;
+                let y_g = y_raw * scale;
+                let z_g = z_raw * scale;
 
-                //info!("Raw Accelerometer Data (m/s²): X = {}, Y = {}, Z = {}", x_raw, y_raw, z_raw);
-                info!("Accelerometer Data (G): X = {}, Y = {}, Z = {}", x_m_s2, y_m_s2, z_m_s2);
-                usb_write!(class, "Accel: X={}, Y={}, Z={}", x_m_s2, y_m_s2, z_m_s2);
+                let data = AccelData {
+                    x: x_g,
+                    y: y_g,
+                    z: z_g,
+                };
+
+                //info!("Accelerometer Data (G): X = {}, Y = {}, Z = {}", x_m_s2, y_m_s2, z_m_s2);
+                // Send to channel and await
+                LSM_ACCEL_CHANNEL.send(data).await;
             }
             Err(_) => {
                 error!("Failed to read accelerometer data");
@@ -87,8 +117,16 @@ pub async fn lsm6dsox_task(mut i2c: I2cDevice<'static, NoopRawMutex, I2c<'static
                 let x_dps = x_raw * scale;
                 let y_dps = y_raw * scale;
                 let z_dps = z_raw * scale;
+
+                let data = GyroData {
+                    x: x_dps,
+                    y: y_dps,
+                    z: z_dps,
+                };
         
-                info!("Gyroscope Data (°/s): X = {}, Y = {}, Z = {}", x_dps, y_dps, z_dps);
+                //info!("Gyroscope Data (°/s): X = {}, Y = {}, Z = {}", x_dps, y_dps, z_dps);
+                // Send to channel and await
+                GYRO_CHANNEL.send(data).await;
             }
             Err(_) => {
                 error!("Failed to read gyroscope data");
@@ -96,7 +134,7 @@ pub async fn lsm6dsox_task(mut i2c: I2cDevice<'static, NoopRawMutex, I2c<'static
         }
 
         // Wait for a short period before the next loop iteration
-        Timer::after(Duration::from_millis(200)).await;
+        Timer::after(Duration::from_millis(WAIT_TIME)).await;
     }
 }
 
@@ -135,7 +173,7 @@ pub async fn setup_lsm6dsox(i2c: &mut I2cDevice<'static, NoopRawMutex, I2c<'stat
     }
 
     // 4. Set accel and gyro scale using update_reg_address
-    let accel_odr = DataRate::Freq6660Hz as u8;  // 0xA0
+    let accel_odr = DataRate::Freq208Hz as u8;  // 0xA0
     let accel_scale = AccelerometerScale::Accel16g as u8;  // 0x04
     let accel_config = accel_odr | accel_scale;
     info!("Accel config: {:#X}", accel_config);
@@ -143,7 +181,7 @@ pub async fn setup_lsm6dsox(i2c: &mut I2cDevice<'static, NoopRawMutex, I2c<'stat
         error!("Failed to configure CTRL1_XL");
     }
 
-    let gyro_odr = DataRate::Freq6660Hz as u8;
+    let gyro_odr = DataRate::Freq208Hz as u8;
     let gyro_scale = GyroscopeScale::Dps2000 as u8;
     let gyro_config = gyro_odr | gyro_scale;
     if update_reg_address(i2c, LSM6DSOX_ADDRESS, CTRL2_G, 0b1111_1100, gyro_config).await.is_err() {
@@ -152,82 +190,240 @@ pub async fn setup_lsm6dsox(i2c: &mut I2cDevice<'static, NoopRawMutex, I2c<'stat
 }
 
 
-pub async fn check_iis2mdctr(mut i2c: I2cDevice<'static, NoopRawMutex, I2c<'static, Async>>) {
-    let mut data = [0u8; 1];
-    info!("Checking IIS2MDCTR");
+// pub async fn check_iis2mdctr(mut i2c: I2cDevice<'static, NoopRawMutex, I2c<'static, Async>>) {
+//     let mut data = [0u8; 1];
+//     info!("Checking IIS2MDCTR");
+//
+//     match i2c.write_read(LSM6DSOX_ADDRESS, &[0x4F], &mut data) {
+//         Ok(()) => {
+//             info!("Whoami: 0x{:02x}", data[0]);
+//         }
+//         Err(_) => error!("IIS2MDCTR check failed")
+//     }
+// }
+//
+// pub async fn check_ms5611(mut i2c: I2cDevice<'static, NoopRawMutex, I2c<'static, Async>>) {
+//     let mut data = [0u8; 12];
+//     info!("Checking ms5611");
+//
+//     info!("Resetting ms5611");
+//     match i2c.write(MS5611_ADDRESS, &[RESET_CMD]) {
+//         Ok(()) => {
+//             info!("Reset Success");
+//             Timer::after_millis(3).await;
+//         }
+//         Err(_) => error!("Reset Failed")
+//     }
+//
+//     info!("Reading PROM data");
+//     for i in 0..6 {
+//         match i2c.write_read(MS5611_ADDRESS, &[PROM_READ_CMD + (i as u8) * 2], &mut data[i*2..(i+1)*2]) {
+//             Ok(()) => {}
+//             Err(_) => error!("Failed to get PROM data")
+//         }
+//     }
+//     info!("PROM calibration data: {:02x}", data);
+//
+//     // Step 3: Start pressure conversion
+//     unwrap!(i2c.blocking_write(MS5611_ADDRESS, &[CONVERT_PRESSURE_CMD]));
+//     Timer::after_millis(10).await; // Wait for conversion (depending on the OSR setting)
+//
+//     // Step 4: Read ADC result for pressure
+//     unwrap!(i2c.blocking_write_read(MS5611_ADDRESS, &[ADC_READ_CMD], &mut data));
+//     let pressure_adc_result = u32::from(data[0]) << 16 | u32::from(data[1]) << 8 | u32::from(data[2]);
+//     info!("Pressure ADC result: 0x{:06x}", pressure_adc_result);
+//
+//     // Step 5: Start temperature conversion
+//     unwrap!(i2c.blocking_write(MS5611_ADDRESS, &[CONVERT_TEMP_CMD]));
+//     Timer::after_millis(10).await; // Wait for conversion (depending on the OSR setting)
+//
+//     // Step 6: Read ADC result for temperature
+//     unwrap!(i2c.blocking_write_read(MS5611_ADDRESS, &[ADC_READ_CMD], &mut data));
+//     let temp_adc_result = u32::from(data[0]) << 16 | u32::from(data[1]) << 8 | u32::from(data[2]);
+//     info!("Temperature ADC result: 0x{:06x}", temp_adc_result);
+// }
 
-    match i2c.write_read(LSM6DSOX_ADDRESS, &[0x4F], &mut data) {
-        Ok(()) => {
-            info!("Whoami: 0x{:02x}", data[0]);
+#[embassy_executor::task(pool_size = 2)]
+pub async fn adxl375_task(
+    mut i2c: I2cDevice<'static, NoopRawMutex, I2c<'static,  Async>>,
+    address: u8
+) {
+    // setup the adxl375 we want
+    setup_adxl375(&mut i2c, address).await;
+
+    loop {
+        // check if new accelerometer data is ready
+        let mut status = [0u8; 1];
+        match i2c.write_read(address, &[INT_SOURCE], &mut status) {
+            Ok(()) => {
+                // if dataready bit is not set, continue to next iteration
+                if (status[0] & 0b1000_0000) == 0 {
+                    continue;
+                }
+            }
+            Err(_) => {
+                error!("Failed to read {} INT_SOURCE", address);
+                continue;
+            }
         }
-        Err(_) => error!("IIS2MDCTR check failed")
+
+        // read accelerometer data (6 bytes, 2 for each axis)
+        let mut accel_data= [0u8; 6];
+        match i2c.write_read(address, &[DATAX0], &mut accel_data) {
+            Ok(()) => {
+                // Combine low and high bytes for X, Y, and Z
+                let x_raw = i16::from_le_bytes([accel_data[0], accel_data[1]]) as f32;
+                let y_raw = i16::from_le_bytes([accel_data[2], accel_data[3]]) as f32;
+                let z_raw = i16::from_le_bytes([accel_data[4], accel_data[5]]) as f32;
+                
+                let scale = ADXL375_SCALE_FACTOR;
+                let x_g = x_raw * scale;
+                let y_g = y_raw * scale;
+                let z_g = z_raw * scale;
+
+                let data =  AccelData {
+                    x: x_g,
+                    y: y_g,
+                    z: z_g,
+                };
+
+                info!("ADXL375 Data (G): X = {}, Y = {}, Z = {}", x_g, y_g, z_g);
+
+                // Seperate data for each sensor
+                if address == ADXL375_LOW_ADDRESS {
+                    ADXL375_1_CHANNEL.send(data).await;
+                }
+                else if address == ADXL375_HIGH_ADDRESS {
+                    ADXL375_2_CHANNEL.send(data).await;
+                }
+            }
+            Err(_) => {
+                error!("Failed to read ADXL375 {} data", address);
+            }
+        }
+
+        // Wait for a short period before the next loop iteration
+        Timer::after(Duration::from_millis(WAIT_TIME)).await;
     }
 }
 
-pub async fn check_ms5611(mut i2c: I2cDevice<'static, NoopRawMutex, I2c<'static, Async>>) {
-    let mut data = [0u8; 12];
-    info!("Checking ms5611");
+pub async fn setup_adxl375(
+    i2c: &mut I2cDevice<'static, NoopRawMutex, I2c<'static, Async>>,
+    address: u8
+) {
+    // 1. Set the ODR and bandwidth
+    if update_reg_address(i2c, address, BW_RATE, 0b0000_1111, ADXL375_200HZ).await.is_err() {
+        error!("Failed to configure ADXL375 {} ODR", address);
+    }
 
-    info!("Resetting ms5611");
-    match i2c.write(MS5611_ADDRESS, &[RESET_CMD]) {
-        Ok(()) => {
-            info!("Reset Success");
-            Timer::after_millis(3).await;
-        }
-        Err(_) => error!("Reset Failed")
+    // 2. Set the FIFO mode (bypass, stream, FIFO, trigger)
+    if update_reg_address(i2c, address, FIFO_CTL, 0b1100_0000, ADXL375_FIFO_BYPASS).await.is_err() {
+        error!("Failed to configure ADXL375 {} FIFO", address);
+    }
+
+    // 3. Set the data format to right justified
+    if update_reg_address(i2c, address, DATA_FORMAT, 0b0000_0100, ADXL375_JUSTIFY_RIGHT).await.is_err() {
+        error!("Failed to configure ADXL375 {} data justification", address);
+    }
+
+    // 4. finally, set the power mode to measure and turn off sleep
+    if update_reg_address(i2c, address, POWER_CTL, 0b0000_1100, ADXL375_MEASURE_MODE).await.is_err() {
+        error!("Failed to put ADXL375 {} into measure mode", address);
     }
     
-    info!("Reading PROM data");
-    for i in 0..6 {
-        match i2c.write_read(MS5611_ADDRESS, &[PROM_READ_CMD + (i as u8) * 2], &mut data[i*2..(i+1)*2]) {
-            Ok(()) => {}
-            Err(_) => error!("Failed to get PROM data")
-        }
+    // 5. apply pre-calibrated offsets
+    if address == ADXL375_LOW_ADDRESS {
+        // Apply offsets for the first sensor
+        apply_adxl375_offsets(i2c, address, ADXL375_1_OFFSET_X, ADXL375_1_OFFSET_Y, ADXL375_1_OFFSET_Z).await;
+    } else if address == ADXL375_HIGH_ADDRESS {
+        // Apply offsets for the second sensor
+        apply_adxl375_offsets(i2c, address, ADXL375_2_OFFSET_X, ADXL375_2_OFFSET_Y, ADXL375_2_OFFSET_Z).await;
     }
-    info!("PROM calibration data: {:02x}", data);
-
-    // // Step 3: Start pressure conversion
-    // unwrap!(i2c.blocking_write(MS5611_ADDRESS, &[CONVERT_PRESSURE_CMD]));
-    // Timer::after_millis(10).await; // Wait for conversion (depending on the OSR setting)
-    // 
-    // // Step 4: Read ADC result for pressure
-    // unwrap!(i2c.blocking_write_read(MS5611_ADDRESS, &[ADC_READ_CMD], &mut data));
-    // let pressure_adc_result = u32::from(data[0]) << 16 | u32::from(data[1]) << 8 | u32::from(data[2]);
-    // info!("Pressure ADC result: 0x{:06x}", pressure_adc_result);
-    // 
-    // // Step 5: Start temperature conversion
-    // unwrap!(i2c.blocking_write(MS5611_ADDRESS, &[CONVERT_TEMP_CMD]));
-    // Timer::after_millis(10).await; // Wait for conversion (depending on the OSR setting)
-    // 
-    // // Step 6: Read ADC result for temperature
-    // unwrap!(i2c.blocking_write_read(MS5611_ADDRESS, &[ADC_READ_CMD], &mut data));
-    // let temp_adc_result = u32::from(data[0]) << 16 | u32::from(data[1]) << 8 | u32::from(data[2]);
-    // info!("Temperature ADC result: 0x{:06x}", temp_adc_result);
+    
+    // Only need to do this once per sensor, then use above to apply them every runtime.
+    //calibrate_offsets(i2c, address, 10, 100).await;
 }
 
-pub async fn check_adxl375(mut i2c: I2cDevice<'static, NoopRawMutex, I2c<'static, Async>>, address: u8) {
-    let mut data = [0u8; 1];
-    if (address == 0x1D) {
-        info!("Checking ADXL375 1");
+async fn apply_adxl375_offsets(
+    i2c: &mut I2cDevice<'static, NoopRawMutex, I2c<'static, Async>>,
+    address: u8,
+    x_offset: i16,
+    y_offset: i16,
+    z_offset: i16,
+) {
+    // Write the offsets to the sensor's offset registers
+    if  update_reg_address(i2c, address, OFSX, 0xFF, -x_offset as u8).await.is_err() ||
+        update_reg_address(i2c, address, OFSY, 0xFF, -y_offset as u8).await.is_err() ||
+        update_reg_address(i2c, address, OFSZ, 0xFF, -z_offset as u8).await.is_err() {
+        error!("Failed to apply offsets to ADXL375 {} offset registers", address);
     }
-    else if (address == 0x53) { 
-        info!("Checking ADXL375 2");
+}
+
+pub async fn calibrate_offsets(
+    i2c: &mut I2cDevice<'static, NoopRawMutex, I2c<'static, Async>>,
+    address: u8,
+    num_samples: usize, // Number of samples to average
+    sample_rate_hz: u32, // Sample rate in Hz (should be >= 100 Hz)
+) {
+    let mut x_sum = 0i16;
+    let mut y_sum = 0i16;
+    let mut z_sum = 0i16;
+
+    // Step 1: Sample the sensor multiple times to get an average
+    for _ in 0..num_samples {
+        let mut accel_data = [0u8; 6];
+        if i2c.write_read(address, &[DATAX0], &mut accel_data).is_ok() {
+            let x_raw = i16::from_le_bytes([accel_data[0], accel_data[1]]);
+            let y_raw = i16::from_le_bytes([accel_data[2], accel_data[3]]);
+            let z_raw = i16::from_le_bytes([accel_data[4], accel_data[5]]);
+
+            // Accumulate raw values for averaging
+            x_sum += x_raw;
+            y_sum += y_raw;
+            z_sum += z_raw;
+        } else {
+            error!("Failed to read ADXL375 {} data", address);
+            return;
+        }
+
+        // Optional: Add a delay to match the sample rate
+        Timer::after_millis(1000/sample_rate_hz as u64).await;
     }
 
-    match i2c.write_read(address, &[0x00], &mut data) {
-        Ok(()) => {
-            info!("Whoami: 0x{:02x}", data[0]);
-        }
-        Err(_) => error!("ADXL375 check failed")
+    // Step 2: Calculate the average for each axis
+    let x_avg = x_sum as f32 / num_samples as f32;
+    let y_avg = y_sum as f32 / num_samples as f32;
+    let z_avg = z_sum as f32 / num_samples as f32;
+
+    // Step 3: Calculate the offset values
+    // For X and Y, subtract the 0g value (which should be close to zero)
+    let x_offset = (x_avg * ADXL375_OFFSET_SCALE) as i16;
+    let y_offset = (y_avg * ADXL375_OFFSET_SCALE) as i16;
+
+    // For Z, subtract 1g field value (assumes ideal sensitivity of SZ LSB/g)
+    let z_offset = (z_avg * ADXL375_OFFSET_SCALE - 1.0) as i16; // Adjust for 1g field
+
+    // Step 4: Write the calculated offsets to the offset registers
+    if update_reg_address(i2c, address, OFSX, 0xFF, -x_offset as u8).await.is_err() ||
+        update_reg_address(i2c, address, OFSY, 0xFF, -y_offset as u8).await.is_err() ||
+        update_reg_address(i2c, address, OFSZ, 0xFF, -z_offset as u8).await.is_err() {
+        error!("Failed to write ADXL375 {} offset registers", address);
+        return;
     }
+
+    // Step 5: Log the results
+    info!(
+        "ADXL375 {} Calibration: X Offset = {}, Y Offset = {}, Z Offset = {}",
+        address, x_offset, y_offset, z_offset
+    );
 }
 
 pub async fn check_lis3dh(mut i2c: I2cDevice<'static, NoopRawMutex, I2c<'static, Async>>, address: u8) {
     let mut data = [0u8; 1];
-    if (address == 0x19) {
+    if address == 0x19 {
         info!("Checking LIS3DH 1");
     }
-    else if (address == 0x18) {
+    else if address == 0x18 {
         info!("Checking LIS3DH 2");
     }
 

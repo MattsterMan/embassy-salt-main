@@ -9,16 +9,53 @@ use embassy_usb::driver::EndpointError;
 use embassy_usb::Builder;
 use panic_probe as _;
 use core::fmt::{Write};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::pubsub::{PubSubChannel, WaitResult};
 use heapless::String;
+use crate::{SensorPacket};
 
 bind_interrupts!(struct Irqs {
     USB => usb::InterruptHandler<peripherals::USB>;
 });
 
+async fn usb_print<'a, T: Instance>(
+    class: &mut CdcAcmClass<'a, Driver<'a, T>>,
+    args: core::fmt::Arguments<'_>,
+) {
+    let mut buffer: String<256> = String::new(); // adjust size as needed
+    let _ = buffer.write_fmt(args);
+    
+    // Send in chunks of 64 or less
+    let mut i = 0;
+    while i < buffer.len() {
+        let end = (i + 64).min(buffer.len());
+        let chunk = &buffer.as_bytes()[i..end];
+        if let Err(e) = class.write_packet(chunk).await {
+            warn!("USB write error: {:?}", e);
+            break;
+        }
+        i = end;
+    }
+
+    // If last chunk was exactly 64 bytes, send a ZLP
+    if buffer.len() % 64 == 0 {
+        let _ = class.write_packet(&[]).await;
+    }
+}
+
+// Handy macro
+#[macro_export]
+macro_rules! usb_write {
+    ($usb:expr, $($arg:tt)*) => {
+        usb_print($usb, format_args!($($arg)*)).await
+    };
+}
+
 pub async fn setup_usb<'d>(
     usb: Peri<'d, USB>,
     dp: Peri<'d, impl DpPin<USB>>,
     dm: Peri<'d, impl DmPin<USB>>,
+    pub_sub_channel: &PubSubChannel<CriticalSectionRawMutex, SensorPacket, 8, 3, 1>,
 ) {
     
     // Do not need the vbus protection config since it doesn't exist for this chip?
@@ -55,17 +92,35 @@ pub async fn setup_usb<'d>(
 
     // Run the USB device.
     let usb_fut = usb.run();
-
+    
+    // Create the subscriber for the usb_serial
+    let mut usb_subscriber = pub_sub_channel.subscriber().unwrap();
+    
     // Do stuff with the class!
     let echo_fut = async {
         loop {
             class.wait_connection().await;
-            info!("Connected");
-
-            usb_print(&mut class, format_args!("Hello USB!\r\n")).await;
+            info!("USB Connected");
+            usb_write!(&mut class, "lsm_accelx,lsm_accely,lsm_accelz,gyrox,gyroy,gyroz,pressure,temp\r\n");
             
-            let _ = echo(&mut class).await;
-            info!("Disconnected");
+            // Continuously poll for sensor data
+            loop {
+                // Check if there are any new sensor messages
+                match usb_subscriber.next_message().await {
+                    WaitResult::Message(packet) => {
+                        usb_write!(&mut class, "{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}\r\n",
+                        packet.lsm_accel.x, packet.lsm_accel.y, packet.lsm_accel.z,
+                        packet.gyro.x, packet.gyro.y, packet.gyro.z,
+                        packet.pressure, packet.temperature,
+                        packet.adxl_1.x, packet.adxl_1.y, packet.adxl_1.z,
+                        packet.adxl_2.x, packet.adxl_2.y, packet.adxl_2.z,
+                    );
+                    }
+                    WaitResult::Lagged(e) => {
+                        info!("USB Lagged {:?}", e);
+                    }
+                }
+            }
         }
     };
 
@@ -95,19 +150,3 @@ async fn echo<'d, T: Instance + 'd>(class: &mut CdcAcmClass<'d, Driver<'d, T>>) 
     }
 }
 
-pub async fn usb_print<'a, T: Instance>(
-    class: &mut CdcAcmClass<'a, Driver<'a, T>>,
-    args: core::fmt::Arguments<'_>,
-) {
-    let mut buffer: String<256> = String::new(); // adjust size as needed
-    let _ = buffer.write_fmt(args);
-    let _ = class.write_packet(buffer.as_bytes()).await;
-}
-
-// Handy macro
-#[macro_export]
-macro_rules! usb_write {
-    ($usb:expr, $($arg:tt)*) => {
-        usb_print($usb, format_args!($($arg)*)).await
-    };
-}

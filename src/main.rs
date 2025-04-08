@@ -5,6 +5,7 @@ mod sensors;
 mod lsm6dsox;
 mod registers;
 mod usb_serial;
+mod adxl375;
 
 use core::cell::RefCell;
 use defmt::*;
@@ -16,9 +17,12 @@ use embassy_stm32::i2c::I2c;
 use embassy_stm32::mode::Async;
 use embassy_stm32::time::Hertz;
 use embassy_sync::blocking_mutex::NoopMutex;
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex, ThreadModeRawMutex};
+use embassy_sync::mutex::Mutex;
+use embassy_sync::pubsub::{PubSubBehavior, PubSubChannel};
 use embassy_time::{Timer};
 use static_cell::StaticCell;
-
+use crate::adxl375::{ADXL375_LOW_ADDRESS, ADXL375_HIGH_ADDRESS};
 // Sensors
 use crate::sensors::*;
 
@@ -26,6 +30,23 @@ use crate::sensors::*;
 use crate::usb_serial::*;
 
 static I2C_BUS: StaticCell<NoopMutex<RefCell<I2c<'static, Async>>>> = StaticCell::new();
+
+// Combine all sensor data into one struct for packetization
+#[derive(Clone)]
+pub struct SensorPacket {
+    pub lsm_accel: AccelData,
+    pub gyro: GyroData,
+    pub pressure: f32,
+    pub temperature: f32,
+    pub adxl_1: AccelData,
+    pub adxl_2: AccelData,
+    pub lis_1: AccelData,
+    pub lis_2: AccelData,
+}
+
+pub const SENSOR_SUBSCRIBERS: usize = 3; // how many subscribers to this channel
+pub const SENSOR_PUBLISHERS: usize = 1;  // how many publishers (senders)
+pub static SENSOR_PUBSUB: PubSubChannel<CriticalSectionRawMutex, SensorPacket, 8, SENSOR_SUBSCRIBERS, SENSOR_PUBLISHERS> = PubSubChannel::new();
 
 bind_interrupts!(struct Irqs {
     I2C1_EV => i2c::EventInterruptHandler<peripherals::I2C1>;
@@ -77,16 +98,63 @@ async fn main(spawner: Spawner) {
     let i2c_adxl375_2 = I2cDevice::new(i2c_bus);
     let i2c_lis3dh_1 = I2cDevice::new(i2c_bus);
     let i2c_lis3dh_2 = I2cDevice::new(i2c_bus);
-
-    let class = setup_usb(p.USB, p.PA12, p.PA11).await;
     
     spawner.spawn(lsm6dsox_task(i2c_lsm6dsox)).unwrap();
+    spawner.spawn(adxl375_task(i2c_adxl375_1, ADXL375_LOW_ADDRESS)).unwrap();
+    spawner.spawn(adxl375_task(i2c_adxl375_2, ADXL375_HIGH_ADDRESS)).unwrap();
     
+    spawner.spawn(aggregator_task()).unwrap();
+
+    setup_usb(p.USB, p.PA12, p.PA11, &SENSOR_PUBSUB).await;
     
     loop {
         led.set_high();
         Timer::after_millis(500).await;
         led.set_low();
         Timer::after_millis(500).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn aggregator_task() {
+    loop {
+        let mut data_packet = SensorPacket {
+            lsm_accel: AccelData::default(),
+            gyro: GyroData::default(),
+            pressure: 0.0,
+            temperature: 0.0,
+            adxl_1: AccelData::default(),
+            adxl_2: AccelData::default(),
+            lis_1: AccelData::default(),
+            lis_2: AccelData::default(),
+        };
+        
+        match LSM_ACCEL_CHANNEL.try_receive() {
+            Ok(data) => data_packet.lsm_accel = data,
+            Err(e) => info!("Error receiving LSM accel data: {:?}", e),
+        }
+        match GYRO_CHANNEL.try_receive() {
+            Ok(data) => data_packet.gyro = data,
+            Err(e) => info!("Error receiving LSM gyro data: {:?}", e),
+        }
+        match ADXL375_1_CHANNEL.try_receive() {
+            Ok(data) => data_packet.adxl_1 = data,
+            Err(e) => info!("Error receiving LSM gyro data: {:?}", e),
+        }
+        match ADXL375_2_CHANNEL.try_receive() {
+            Ok(data) => data_packet.adxl_2 = data,
+            Err(e) => info!("Error receiving LSM gyro data: {:?}", e),
+        }
+        info!("Accel Data (consumer): X = {}, Y = {}, Z = {}", data_packet.lsm_accel.x, data_packet.lsm_accel.y, data_packet.lsm_accel.z);
+        // let gyro_data = GYRO_CHANNEL.receive().await;
+        // let adxl375_1_data = ADXL375_1_CHANNEL.receive().await;
+        // let adxl375_2_data = ADXL375_2_CHANNEL.receive().await;
+        
+        // Broadcast this packet to telemetry consumers (data storage, radio, CAN)
+        // This will publish without waiting for an empty slot. change to a publisher to correctly wait for space with "publish()"
+        SENSOR_PUBSUB.publish_immediate(data_packet);
+        
+        // adjust timer based on how fast each subscriber needs the data
+        Timer::after_millis(10).await;
     }
 }
