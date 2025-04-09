@@ -108,12 +108,14 @@ pub async fn setup_usb<'d>(
                 // Check if there are any new sensor messages
                 match usb_subscriber.next_message().await {
                     WaitResult::Message(packet) => {
-                        usb_write!(&mut class, "{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}\r\n",
+                        usb_write!(&mut class, "{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}\r\n",
                         packet.lsm_accel.x, packet.lsm_accel.y, packet.lsm_accel.z,
                         packet.gyro.x, packet.gyro.y, packet.gyro.z,
                         packet.pressure, packet.temperature,
                         packet.adxl_1.x, packet.adxl_1.y, packet.adxl_1.z,
                         packet.adxl_2.x, packet.adxl_2.y, packet.adxl_2.z,
+                        packet.lis_1.x, packet.lis_1.y, packet.lis_1.z,
+                        packet.lis_2.x, packet.lis_2.y, packet.lis_2.z,
                     );
                     }
                     WaitResult::Lagged(e) => {

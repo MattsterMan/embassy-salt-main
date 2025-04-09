@@ -6,6 +6,7 @@ mod lsm6dsox;
 mod registers;
 mod usb_serial;
 mod adxl375;
+mod lis3dh;
 
 use core::cell::RefCell;
 use defmt::*;
@@ -23,6 +24,7 @@ use embassy_sync::pubsub::{PubSubBehavior, PubSubChannel};
 use embassy_time::{Timer};
 use static_cell::StaticCell;
 use crate::adxl375::{ADXL375_LOW_ADDRESS, ADXL375_HIGH_ADDRESS};
+use crate::lis3dh::{LIS3DH_HIGH_ADDRESS, LIS3DH_LOW_ADDRESS};
 // Sensors
 use crate::sensors::*;
 
@@ -102,9 +104,11 @@ async fn main(spawner: Spawner) {
     spawner.spawn(lsm6dsox_task(i2c_lsm6dsox)).unwrap();
     spawner.spawn(adxl375_task(i2c_adxl375_1, ADXL375_LOW_ADDRESS)).unwrap();
     spawner.spawn(adxl375_task(i2c_adxl375_2, ADXL375_HIGH_ADDRESS)).unwrap();
+    spawner.spawn(lis3dh_task(i2c_lis3dh_1, LIS3DH_LOW_ADDRESS)).unwrap();
+    spawner.spawn(lis3dh_task(i2c_lis3dh_2, LIS3DH_HIGH_ADDRESS)).unwrap();
     
     spawner.spawn(aggregator_task()).unwrap();
-
+    
     setup_usb(p.USB, p.PA12, p.PA11, &SENSOR_PUBSUB).await;
     
     loop {
@@ -117,6 +121,17 @@ async fn main(spawner: Spawner) {
 
 #[embassy_executor::task]
 async fn aggregator_task() {
+    fn try_receive_to<T: core::fmt::Debug>(
+        channel: &embassy_sync::channel::Channel<CriticalSectionRawMutex, T, 8>,
+        dest: &mut T,
+        label: &str,
+    ) {
+        match channel.try_receive() {
+            Ok(data) => *dest = data,
+            Err(e) => info!("Error receiving {} data: {:?}", label, e),
+        }
+    }
+    
     loop {
         let mut data_packet = SensorPacket {
             lsm_accel: AccelData::default(),
@@ -128,33 +143,19 @@ async fn aggregator_task() {
             lis_1: AccelData::default(),
             lis_2: AccelData::default(),
         };
-        
-        match LSM_ACCEL_CHANNEL.try_receive() {
-            Ok(data) => data_packet.lsm_accel = data,
-            Err(e) => info!("Error receiving LSM accel data: {:?}", e),
-        }
-        match GYRO_CHANNEL.try_receive() {
-            Ok(data) => data_packet.gyro = data,
-            Err(e) => info!("Error receiving LSM gyro data: {:?}", e),
-        }
-        match ADXL375_1_CHANNEL.try_receive() {
-            Ok(data) => data_packet.adxl_1 = data,
-            Err(e) => info!("Error receiving LSM gyro data: {:?}", e),
-        }
-        match ADXL375_2_CHANNEL.try_receive() {
-            Ok(data) => data_packet.adxl_2 = data,
-            Err(e) => info!("Error receiving LSM gyro data: {:?}", e),
-        }
-        info!("Accel Data (consumer): X = {}, Y = {}, Z = {}", data_packet.lsm_accel.x, data_packet.lsm_accel.y, data_packet.lsm_accel.z);
-        // let gyro_data = GYRO_CHANNEL.receive().await;
-        // let adxl375_1_data = ADXL375_1_CHANNEL.receive().await;
-        // let adxl375_2_data = ADXL375_2_CHANNEL.receive().await;
+        try_receive_to(&LSM_ACCEL_CHANNEL, &mut data_packet.lsm_accel, "LSM accel");
+        try_receive_to(&GYRO_CHANNEL, &mut data_packet.gyro, "gyro");
+        try_receive_to(&ADXL375_1_CHANNEL, &mut data_packet.adxl_1, "ADXL1");
+        try_receive_to(&ADXL375_2_CHANNEL, &mut data_packet.adxl_2, "ADXL2");
+        try_receive_to(&LIS3DH_1_CHANNEL, &mut data_packet.lis_1, "LIS1");
+        try_receive_to(&LIS3DH_2_CHANNEL, &mut data_packet.lis_2, "LIS2");
+        info!("Accel Data LIS: X = {}, Y = {}, Z = {}", data_packet.lis_2.x, data_packet.lis_2.y, data_packet.lis_2.z);
         
         // Broadcast this packet to telemetry consumers (data storage, radio, CAN)
         // This will publish without waiting for an empty slot. change to a publisher to correctly wait for space with "publish()"
         SENSOR_PUBSUB.publish_immediate(data_packet);
         
         // adjust timer based on how fast each subscriber needs the data
-        Timer::after_millis(10).await;
+        Timer::after_millis(100).await;
     }
 }

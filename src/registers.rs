@@ -21,19 +21,18 @@ pub async fn update_reg_address(
     // Step 1: Read the current value of the register
     match i2c.write_read(address, &[reg], &mut reg_val) {
         Ok(()) => {
-            // Step 2: Log the previous register value
-            info!("Register 0x{:02X} previous value: 0x{:02X}", reg, reg_val[0]);
+            let old_val = reg_val[0];
 
-            // Step 3: Modify the register value by clearing the bits specified by the mask
+            // Step 2: Modify the register value by clearing the bits specified by the mask
             reg_val[0] &= !bitmask; // Clear the bits we want to change
 
-            // Step 4: Set the new data to the masked bits
+            // Step 3: Set the new data to the masked bits
             reg_val[0] |= new_value & bitmask; // Apply new value to the masked bits
 
-            // Step 5: Log the new register value
-            info!("Register 0x{:02X} new value: 0x{:02X}", reg, reg_val[0]);
+            // Step 4: Log old and new register value
+            info!("Register 0x{:02X}: old=0x{:02X}, new=0x{:02X}", reg, old_val, reg_val[0]);
 
-            // Step 6: Write the modified value back to the register
+            // Step 5: Write the modified value back to the register
             match i2c.write(address, &[reg, reg_val[0]]) {
                 Ok(()) => {
                     info!("Register 0x{:02X} updated successfully", reg);
@@ -49,5 +48,19 @@ pub async fn update_reg_address(
             error!("Failed to read register 0x{:02X}", reg);
             Err(())
         }
+    }
+}
+
+pub async fn debug_register(
+    i2c: &mut I2cDevice<'static, NoopRawMutex, I2c<'static, Async>>,
+    address: u8,
+    register: u8,
+    name: &str,
+) {
+    let mut buf = [0u8; 1];
+    if i2c.write_read(address, &[register], &mut buf).is_ok() {
+        info!("{} (0x{:02X}): 0x{:02X}", name, register, buf[0]);
+    } else {
+        error!("Failed to read {}", name);
     }
 }

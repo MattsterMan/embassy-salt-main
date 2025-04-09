@@ -6,7 +6,7 @@ pub const CTRL9_XL: u8 = 0x18;  // Control register 9
 pub const I3C_BUS_AVB: u8 = 0x62;  // I3C AVB register
 pub const OUTX_L_A: u8 = 0x28;   // Accelerometer X-axis low byte
 pub const OUTX_L_G: u8 = 0x22;   // Gyroscope X-axis low byte
-pub const STATUS_REG: u8 = 0x1E;      // Status register to check if data is ready
+pub const LSMDSOX_STATUS_REG: u8 = 0x1E;      // Status register to check if data is ready
 
 pub enum AccelerometerScale {
     /// ±2g accelerometer Scale
