@@ -5,25 +5,16 @@ use embassy_stm32::mode::Async;
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::channel::Channel;
 use embassy_time::{Timer, Duration, Delay};
-use embedded_hal::prelude::{_embedded_hal_blocking_i2c_WriteRead};
+use embedded_hal::prelude::{_embedded_hal_blocking_i2c_Write, _embedded_hal_blocking_i2c_WriteRead};
 use {defmt_rtt as _, panic_probe as _};
 use crate::adxl375::*;
+use crate::iis2mdctr::*;
 use crate::lsm6dsox::*;
 use crate::registers::*;
 use crate::lis3dh::*;
+use crate::ms5611::*;
 
 pub const SENSOR_CHANNEL_CAPACITY: usize = 8;
-
-pub const DEVID: u8 = 0x00;
-pub const RESET_CMD: u8 = 0x1E;
-pub const PROM_READ_CMD: u8 = 0xA0;
-pub const ADC_READ_CMD: u8 = 0x00;
-pub const CONVERT_PRESSURE_CMD: u8 = 0x40;
-pub const CONVERT_TEMP_CMD: u8 = 0x50;
-
-const LSM6DSOX_ADDRESS: u8 = 0x6A;  // LSM6DSOX when SA0 is low
-const IIS2MDCTR_ADDRESS: u8 = 0x1E;  // fixed since no SA0 pin
-const MS5611_ADDRESS: u8 = 0x77;  // when CSB is low
 
 // millisecond wait for sensor tasks
 const WAIT_TIME: u64 = 5;
@@ -42,8 +33,16 @@ pub struct GyroData{
     pub z: f32,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct MagData{
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
 pub static LSM_ACCEL_CHANNEL: Channel<CriticalSectionRawMutex, AccelData, 8> = Channel::new();
 pub static GYRO_CHANNEL: Channel<CriticalSectionRawMutex, GyroData, 8> = Channel::new();
+pub static IIS2MDCTR_CHANNEL: Channel<CriticalSectionRawMutex, MagData, 8> = Channel::new();
 pub static ADXL375_1_CHANNEL: Channel<CriticalSectionRawMutex, AccelData, 8> = Channel::new();
 pub static ADXL375_2_CHANNEL: Channel<CriticalSectionRawMutex, AccelData, 8> = Channel::new();
 pub static LIS3DH_1_CHANNEL: Channel<CriticalSectionRawMutex, AccelData, 8> = Channel::new();
@@ -381,14 +380,14 @@ pub async fn lis3dh_task(
         let mut status = [0u8; 1];
         match i2c.write_read(address, &[LIS3DH_STATUS_REG], &mut status) {
             Ok(()) => {
-                info!("Lis3dh status register: 0x{:x}", status[0]);
+                //info!("Lis3dh status register: 0x{:x}", status[0]);
                 // If the XLDA (accelerometer data available) bit is not set, continue to the next loop iteration
                 if (status[0] & LIS3DH_DATA_RDY) == 0 {
                     continue; // No new data, skip this iteration
                 }
             }
             Err(_) => {
-                error!("Failed to read STATUS_REG");
+                error!("Failed to read LIS3 STATUS_REG");
                 continue;
             }
         }
@@ -464,55 +463,182 @@ async fn setup_lis3dh(
     }
 }
 
-// pub async fn check_iis2mdctr(mut i2c: I2cDevice<'static, NoopRawMutex, I2c<'static, Async>>) {
-//     let mut data = [0u8; 1];
-//     info!("Checking IIS2MDCTR");
-//
-//     match i2c.write_read(LSM6DSOX_ADDRESS, &[0x4F], &mut data) {
-//         Ok(()) => {
-//             info!("Whoami: 0x{:02x}", data[0]);
-//         }
-//         Err(_) => error!("IIS2MDCTR check failed")
-//     }
-// }
-//
-// pub async fn check_ms5611(mut i2c: I2cDevice<'static, NoopRawMutex, I2c<'static, Async>>) {
-//     let mut data = [0u8; 12];
-//     info!("Checking ms5611");
-//
-//     info!("Resetting ms5611");
-//     match i2c.write(MS5611_ADDRESS, &[RESET_CMD]) {
-//         Ok(()) => {
-//             info!("Reset Success");
-//             Timer::after_millis(3).await;
-//         }
-//         Err(_) => error!("Reset Failed")
-//     }
-//
-//     info!("Reading PROM data");
-//     for i in 0..6 {
-//         match i2c.write_read(MS5611_ADDRESS, &[PROM_READ_CMD + (i as u8) * 2], &mut data[i*2..(i+1)*2]) {
-//             Ok(()) => {}
-//             Err(_) => error!("Failed to get PROM data")
-//         }
-//     }
-//     info!("PROM calibration data: {:02x}", data);
-//
-//     // Step 3: Start pressure conversion
-//     unwrap!(i2c.blocking_write(MS5611_ADDRESS, &[CONVERT_PRESSURE_CMD]));
-//     Timer::after_millis(10).await; // Wait for conversion (depending on the OSR setting)
-//
-//     // Step 4: Read ADC result for pressure
-//     unwrap!(i2c.blocking_write_read(MS5611_ADDRESS, &[ADC_READ_CMD], &mut data));
-//     let pressure_adc_result = u32::from(data[0]) << 16 | u32::from(data[1]) << 8 | u32::from(data[2]);
-//     info!("Pressure ADC result: 0x{:06x}", pressure_adc_result);
-//
-//     // Step 5: Start temperature conversion
-//     unwrap!(i2c.blocking_write(MS5611_ADDRESS, &[CONVERT_TEMP_CMD]));
-//     Timer::after_millis(10).await; // Wait for conversion (depending on the OSR setting)
-//
-//     // Step 6: Read ADC result for temperature
-//     unwrap!(i2c.blocking_write_read(MS5611_ADDRESS, &[ADC_READ_CMD], &mut data));
-//     let temp_adc_result = u32::from(data[0]) << 16 | u32::from(data[1]) << 8 | u32::from(data[2]);
-//     info!("Temperature ADC result: 0x{:06x}", temp_adc_result);
-// }
+#[embassy_executor::task]
+pub async fn iis2mdctr_task(mut i2c: I2cDevice<'static, NoopRawMutex, I2c<'static,  Async>>) {
+    // set up the sensor
+    setup_iis2mdctr(&mut i2c).await;
+
+    loop {
+        // check if data is ready for xyz
+        let mut status = [0u8; 1];
+        match i2c.write_read(IIS2MDCTR_ADDRESS, &[STATUS_REG], &mut status) {
+            Ok(()) => {
+                if (status[0] & IIS2MDCTR_DATA_RDY) == 0 {
+                    continue;
+                }
+            }
+            Err(_) => {
+                error!("Failed to read MAG STATUS_REG");
+            }
+        }
+
+        // Read accelerometer data
+        let mut mag_data = [0u8; 6];
+        // Read the first register for data while setting MSB (7) to a 1 for auto-increment.
+        match i2c.write_read(IIS2MDCTR_ADDRESS, &[BEGIN_READ_REG], &mut mag_data) {
+            Ok(()) => {
+                // Convert raw bytes to i16 values
+                let x_raw = i16::from_le_bytes([mag_data[0], mag_data[1]]);
+                let y_raw = i16::from_le_bytes([mag_data[2], mag_data[3]]);
+                let z_raw = i16::from_le_bytes([mag_data[4], mag_data[5]]);
+
+                let x_g = x_raw as f32 * IIS2MDCTR_GAUSS_SCALE;
+                let y_g = y_raw as f32 * IIS2MDCTR_GAUSS_SCALE;
+                let z_g = z_raw as f32 * IIS2MDCTR_GAUSS_SCALE;
+
+                let data = MagData {
+                    x: x_g,
+                    y: y_g,
+                    z: z_g,
+                };
+
+                // Send data to the channel
+                IIS2MDCTR_CHANNEL.send(data).await;
+            }
+            Err(_) => {
+                error!("Failed to read MAG data");
+            }
+        }
+        
+        Timer::after_millis(WAIT_TIME).await;
+    }
+}
+
+async fn setup_iis2mdctr(i2c: &mut I2cDevice<'static, NoopRawMutex, I2c<'static, Async>>) {
+    // 1. reset software
+    let reset_command: u8 = 0b0100_0000; // SW Reset Command for LSM6DSOX (CTRL3_C)
+    if update_reg_address(i2c, IIS2MDCTR_ADDRESS, CFG_REG_A, 0b0100_0000, reset_command).await.is_err() {
+        error!("Failed to send MAG reset command");
+    }
+    
+    Timer::after_millis(50).await;
+    
+    // 2. enable temperature compensation, set ODR, enable continuous mode
+    let config = IIS2MDCTR_CONTINUOUS_MODE | IIS2MDCTR_TEMP_EN | IIS2MDCTR_ODR_100Hz;
+    if update_reg_address(i2c, IIS2MDCTR_ADDRESS, CFG_REG_A, 0b1000_1111, config).await.is_err() {
+        error!("Failed to set ODR, Continuous mode, and temperature compensation");
+    }
+    
+    // 3. Enable block data update (BDU)
+    if update_reg_address(i2c, IIS2MDCTR_ADDRESS, CFG_REG_C, 0b0001_0000, IIS2MDCTR_BDU_EN).await.is_err() {
+        error!("Failed to enable BDU");
+    }
+}
+
+#[embassy_executor::task]
+pub async fn ms5611_task(mut i2c: I2cDevice<'static, NoopRawMutex, I2c<'static, Async>>) {
+    // reset device then read PROM calibration data
+    let prom_data = match setup_ms5611(&mut i2c).await {
+        Ok(data) => data,
+        Err(_) => {
+            error!("MS5611 setup failed");
+            return;
+        }
+    };
+
+    loop {
+        // Start pressure conversion (D1)
+        let mut d1: u32 = 0;
+        match i2c.write(MS5611_ADDRESS, &[CONVERT_PRESSURE_CMD]) {
+            Ok(()) => {
+                Timer::after_millis(10).await;
+                let mut adc_buf = [0u8; 3];
+                match i2c.write_read(MS5611_ADDRESS, &[ADC_READ_CMD], &mut adc_buf) {
+                    Ok(()) => {
+                        d1 = ((adc_buf[0] as u32) << 16)
+                            | ((adc_buf[1] as u32) << 8)
+                            | adc_buf[2] as u32;
+                    }
+                    Err(_) => {
+                        error!("Failed to read pressure ADC");
+                        continue;
+                    }
+                }
+            }
+            Err(_) => {
+                error!("Failed to start pressure conversion");
+                continue;
+            }
+        }
+
+        // Start temperature conversion (D2)
+        let mut d2: u32 = 0;
+        match i2c.write(MS5611_ADDRESS, &[CONVERT_TEMP_CMD]) {
+            Ok(()) => {
+                Timer::after_millis(10).await;
+                let mut adc_buf = [0u8; 3];
+                match i2c.write_read(MS5611_ADDRESS, &[ADC_READ_CMD], &mut adc_buf) {
+                    Ok(()) => {
+                        d2 = ((adc_buf[0] as u32) << 16)
+                            | ((adc_buf[1] as u32) << 8)
+                            | adc_buf[2] as u32;
+                    }
+                    Err(_) => {
+                        error!("Failed to read temperature ADC");
+                        continue;
+                    }
+                }
+            }
+            Err(_) => {
+                error!("Failed to start temperature conversion");
+                continue;
+            }
+        }
+        
+        let (temp_c, pressure_mbar) = compensate_ms5611(d1, d2, &prom_data);
+        info!("MS5611: Temp = {} °C, Pressure = {} mbar", temp_c, pressure_mbar);
+
+        Timer::after_millis(WAIT_TIME).await;
+    }
+}
+
+async fn setup_ms5611(
+    i2c: &mut I2cDevice<'static, NoopRawMutex, I2c<'static, Async>>,
+) -> Result<PromData, ()> {
+    let mut prom_raw = [0u16; 8];
+
+    for i in 0..8 {
+        let addr = PROM_READ_CMD + (i as u8) * 2;
+        let mut buf = [0u8; 2];
+        match i2c.write_read(MS5611_ADDRESS, &[addr], &mut buf){
+         Ok(()) => {} 
+         Err(_) => {
+             error!("Failed to read PROM snippet");
+         } 
+        }
+        prom_raw[i] = u16::from_be_bytes(buf);
+    }
+
+    // Perform CRC4 check
+    let crc_read = (prom_raw[7] & 0xF); // only bottom 4 bits
+    let crc_calc = ms5611_crc4(&prom_raw[..7]);
+
+    if crc_read != crc_calc {
+        error!("PROM CRC did not match: {} != {}", crc_read, crc_calc);
+        return Err(());
+    }
+
+    // Create PromData
+    let prom = PromData {
+        c1: prom_raw[1],
+        c2: prom_raw[2],
+        c3: prom_raw[3],
+        c4: prom_raw[4],
+        c5: prom_raw[5],
+        c6: prom_raw[6],
+    };
+
+    info!("PromData: c1-{}, c2-{}, c3-{}, c4-{}, c5-{}, c6-{}, ", prom.c1, prom.c2, prom.c3, prom.c4, prom.c5, prom.c6);    
+
+    Ok(prom)
+}
