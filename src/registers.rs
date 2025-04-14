@@ -1,10 +1,10 @@
+use cortex_m::prelude::{_embedded_hal_blocking_i2c_Write, _embedded_hal_blocking_i2c_WriteRead};
 use defmt::*;
 use embassy_stm32::i2c::I2c;
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
 use embassy_stm32::mode::Async;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_time::{Timer, Delay, Duration};
-use embedded_hal::prelude::{_embedded_hal_blocking_i2c_Write, _embedded_hal_blocking_i2c_WriteRead};
 use {defmt_rtt as _, panic_probe as _};
 
 /// Read-modify-write a register for a given sensor at a given address. Prevents overwriting

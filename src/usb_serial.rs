@@ -101,22 +101,37 @@ pub async fn setup_usb<'d>(
         loop {
             class.wait_connection().await;
             info!("USB Connected");
-            usb_write!(&mut class, "lsm_accelx,lsm_accely,lsm_accelz,gyrox,gyroy,gyroz,pressure,temp\r\n");
+            usb_write!(
+                &mut class,
+                "time,lsm_accelx,lsm_accely,lsm_accelz,gyrox,gyroy,gyroz,\
+                pressure,temp,adxl1x,adxl1y,adxl1z,adxl2x,adxl2y,adxl2z,\
+                lis1x,lis1y,lis1z,lis2x,lis2y,lis2z\r\n");
             
             // Continuously poll for sensor data
             loop {
                 // Check if there are any new sensor messages
                 match usb_subscriber.next_message().await {
                     WaitResult::Message(packet) => {
-                        usb_write!(&mut class, "{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}\r\n",
+                        usb_write!(&mut class, "{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}\r\n",
+                        packet.time,
                         packet.lsm_accel.x, packet.lsm_accel.y, packet.lsm_accel.z,
                         packet.gyro.x, packet.gyro.y, packet.gyro.z,
-                        packet.pressure, packet.temperature,
+                        packet.baro.pressure_mbar, packet.baro.temp_c,
                         packet.adxl_1.x, packet.adxl_1.y, packet.adxl_1.z,
                         packet.adxl_2.x, packet.adxl_2.y, packet.adxl_2.z,
                         packet.lis_1.x, packet.lis_1.y, packet.lis_1.z,
                         packet.lis_2.x, packet.lis_2.y, packet.lis_2.z,
                     );
+                    
+                    // To test the accelerometers alone
+                    // WaitResult::Message(packet) => {
+                    //     usb_write!(&mut class, "{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}\r\n",
+                    //     packet.time,
+                    //     packet.adxl_1.x, packet.adxl_1.y, packet.adxl_1.z,
+                    //     packet.adxl_2.x, packet.adxl_2.y, packet.adxl_2.z,
+                    //     packet.lis_1.x, packet.lis_1.y, packet.lis_1.z,
+                    //     packet.lis_2.x, packet.lis_2.y, packet.lis_2.z,
+                    // );
                     }
                     WaitResult::Lagged(e) => {
                         info!("USB Lagged {:?}", e);

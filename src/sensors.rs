@@ -1,11 +1,11 @@
+use cortex_m::prelude::_embedded_hal_blocking_i2c_WriteRead;
 use defmt::*;
 use embassy_stm32::i2c::I2c;
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
 use embassy_stm32::mode::Async;
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::channel::Channel;
-use embassy_time::{Timer, Duration, Delay};
-use embedded_hal::prelude::{_embedded_hal_blocking_i2c_Write, _embedded_hal_blocking_i2c_WriteRead};
+use embassy_time::{Timer, Duration};
 use {defmt_rtt as _, panic_probe as _};
 use crate::adxl375::*;
 use crate::iis2mdctr::*;
@@ -47,8 +47,7 @@ pub static ADXL375_1_CHANNEL: Channel<CriticalSectionRawMutex, AccelData, 8> = C
 pub static ADXL375_2_CHANNEL: Channel<CriticalSectionRawMutex, AccelData, 8> = Channel::new();
 pub static LIS3DH_1_CHANNEL: Channel<CriticalSectionRawMutex, AccelData, 8> = Channel::new();
 pub static LIS3DH_2_CHANNEL: Channel<CriticalSectionRawMutex, AccelData, 8> = Channel::new();
-
-
+pub static MS5611_CHANNEL: Channel<CriticalSectionRawMutex, Ms5611Sample, 8> = Channel::new();
 
 #[embassy_executor::task]
 pub async fn lsm6dsox_task(
@@ -547,57 +546,23 @@ pub async fn ms5611_task(mut i2c: I2cDevice<'static, NoopRawMutex, I2c<'static, 
     };
 
     loop {
-        // Start pressure conversion (D1)
-        let mut d1: u32 = 0;
-        match i2c.write(MS5611_ADDRESS, &[CONVERT_PRESSURE_CMD]) {
-            Ok(()) => {
-                Timer::after_millis(10).await;
-                let mut adc_buf = [0u8; 3];
-                match i2c.write_read(MS5611_ADDRESS, &[ADC_READ_CMD], &mut adc_buf) {
-                    Ok(()) => {
-                        d1 = ((adc_buf[0] as u32) << 16)
-                            | ((adc_buf[1] as u32) << 8)
-                            | adc_buf[2] as u32;
-                    }
-                    Err(_) => {
-                        error!("Failed to read pressure ADC");
-                        continue;
-                    }
-                }
+        // read temperature and pressure data
+        // osr of 2048 => ~110 Hz, 1024 => ~218 Hz
+        match read_sample(&mut i2c, &prom_data, Osr::Opt2048).await {
+            Ok(sample) => {
+                info!(
+                    "MS5611: Temp = {} °C, Pressure = {} mbar",
+                    sample.temp_c,
+                    sample.pressure_mbar,
+                );
+                
+                MS5611_CHANNEL.send(sample).await;
             }
             Err(_) => {
-                error!("Failed to start pressure conversion");
-                continue;
-            }
-        }
-
-        // Start temperature conversion (D2)
-        let mut d2: u32 = 0;
-        match i2c.write(MS5611_ADDRESS, &[CONVERT_TEMP_CMD]) {
-            Ok(()) => {
-                Timer::after_millis(10).await;
-                let mut adc_buf = [0u8; 3];
-                match i2c.write_read(MS5611_ADDRESS, &[ADC_READ_CMD], &mut adc_buf) {
-                    Ok(()) => {
-                        d2 = ((adc_buf[0] as u32) << 16)
-                            | ((adc_buf[1] as u32) << 8)
-                            | adc_buf[2] as u32;
-                    }
-                    Err(_) => {
-                        error!("Failed to read temperature ADC");
-                        continue;
-                    }
-                }
-            }
-            Err(_) => {
-                error!("Failed to start temperature conversion");
-                continue;
+                error!("MS5611 read_sample failed");
             }
         }
         
-        let (temp_c, pressure_mbar) = compensate_ms5611(d1, d2, &prom_data);
-        info!("MS5611: Temp = {} °C, Pressure = {} mbar", temp_c, pressure_mbar);
-
         Timer::after_millis(WAIT_TIME).await;
     }
 }
@@ -605,40 +570,14 @@ pub async fn ms5611_task(mut i2c: I2cDevice<'static, NoopRawMutex, I2c<'static, 
 async fn setup_ms5611(
     i2c: &mut I2cDevice<'static, NoopRawMutex, I2c<'static, Async>>,
 ) -> Result<PromData, ()> {
-    let mut prom_raw = [0u16; 8];
+    reset(i2c).await?;  // Reset the sensor
+    let prom = read_prom(i2c).await?;  // get the PROM data for use later
 
-    for i in 0..8 {
-        let addr = PROM_READ_CMD + (i as u8) * 2;
-        let mut buf = [0u8; 2];
-        match i2c.write_read(MS5611_ADDRESS, &[addr], &mut buf){
-         Ok(()) => {} 
-         Err(_) => {
-             error!("Failed to read PROM snippet");
-         } 
-        }
-        prom_raw[i] = u16::from_be_bytes(buf);
-    }
-
-    // Perform CRC4 check
-    let crc_read = (prom_raw[7] & 0xF); // only bottom 4 bits
-    let crc_calc = ms5611_crc4(&prom_raw[..7]);
-
-    if crc_read != crc_calc {
-        error!("PROM CRC did not match: {} != {}", crc_read, crc_calc);
-        return Err(());
-    }
-
-    // Create PromData
-    let prom = PromData {
-        c1: prom_raw[1],
-        c2: prom_raw[2],
-        c3: prom_raw[3],
-        c4: prom_raw[4],
-        c5: prom_raw[5],
-        c6: prom_raw[6],
-    };
-
-    info!("PromData: c1-{}, c2-{}, c3-{}, c4-{}, c5-{}, c6-{}, ", prom.c1, prom.c2, prom.c3, prom.c4, prom.c5, prom.c6);    
+    info!("PromData: c1-{}, c2-{}, c3-{}, c4-{}, c5-{}, c6-{}, ", 
+        prom.pressure_sensitivity, prom.pressure_offset,
+        prom.temp_coef_pressure_sensitivity, prom.temp_coef_pressure_offset,
+        prom.temp_ref, prom.temp_coef_temp
+    );    
 
     Ok(prom)
 }
