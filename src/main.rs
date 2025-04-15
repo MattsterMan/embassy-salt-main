@@ -52,6 +52,7 @@ pub struct SensorPacket {
     pub adxl_2: AccelData,
     pub lis_1: AccelData,
     pub lis_2: AccelData,
+    pub gps: GpsRmc,
 }
 
 pub const SENSOR_SUBSCRIBERS: usize = 3; // how many subscribers to this channel
@@ -169,10 +170,9 @@ async fn main(spawner: Spawner) {
     // spawner.spawn(lis3dh_task(i2c_lis3dh_1, LIS3DH_LOW_ADDRESS)).unwrap();
     // spawner.spawn(lis3dh_task(i2c_lis3dh_2, LIS3DH_HIGH_ADDRESS)).unwrap();
     
-    // spawner.spawn(aggregator_task()).unwrap();
-    //
-    // setup_usb(p.USB, p.PA12, p.PA11, &SENSOR_PUBSUB).await;
-
+    spawner.spawn(aggregator_task()).unwrap();
+    spawner.spawn(usb_task(p.USB, p.PA12, p.PA11, &SENSOR_PUBSUB)).unwrap();
+    
     let mut last_read_ts = embassy_time::Instant::now();
 
     loop {
@@ -226,6 +226,7 @@ async fn aggregator_task() {
             adxl_2: AccelData::default(),
             lis_1: AccelData::default(),
             lis_2: AccelData::default(),
+            gps: GpsRmc::default(),
         };
         
         try_receive_to(&LSM_ACCEL_CHANNEL, &mut data_packet.lsm_accel, "LSM accel");
@@ -240,12 +241,19 @@ async fn aggregator_task() {
         // try_receive_to(&LIS3DH_2_CHANNEL, &mut data_packet.lis_2, "LIS2");
         
         info!("Mag Data (gauss): X = {}, Y = {}, Z = {}", data_packet.mag.x, data_packet.mag.y, data_packet.mag.z);
+
+        // Retrieve the most recent GPS data from the Mutex.
+        {
+            let gps_lock = LATEST_GPS.lock().await;
+            // Clone the current GPS value. If no update has ever arrived, this remains None.
+            data_packet.gps = gps_lock.borrow().clone();
+        }
         
         // Broadcast this packet to telemetry consumers (data storage, radio, CAN)
         // This will publish without waiting for an empty slot. change to a publisher to correctly wait for space with "publish()"
         SENSOR_PUBSUB.publish_immediate(data_packet);
         
         // adjust timer based on how fast each subscriber needs the data
-        Timer::after_millis(100).await;
+        Timer::after_millis(10).await;
     }
 }

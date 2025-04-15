@@ -13,6 +13,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::pubsub::{PubSubChannel, WaitResult};
 use heapless::String;
 use crate::{SensorPacket};
+use crate::gps::convert_to_decimal;
 
 bind_interrupts!(struct Irqs {
     USB => usb::InterruptHandler<peripherals::USB>;
@@ -51,24 +52,23 @@ macro_rules! usb_write {
     };
 }
 
-pub async fn setup_usb<'d>(
-    usb: Peri<'d, USB>,
-    dp: Peri<'d, impl DpPin<USB>>,
-    dm: Peri<'d, impl DmPin<USB>>,
-    pub_sub_channel: &PubSubChannel<CriticalSectionRawMutex, SensorPacket, 8, 3, 1>,
+#[embassy_executor::task]
+pub async fn usb_task(
+    usb: Peri<'static, USB>,
+    dp: Peri<'static, peripherals::PA12>,
+    dm: Peri<'static, peripherals::PA11>,
+    pub_sub_channel: &'static PubSubChannel<CriticalSectionRawMutex, SensorPacket, 8, 3, 1>,
 ) {
-    
-    // Do not need the vbus protection config since it doesn't exist for this chip?
+    // Do not need the vbus protection config since it doesn't exist for this chip.
     let driver = Driver::new(usb, Irqs, dp, dm);
 
-    // Create embassy-usb Config
+    // Create embassy-usb Config.
     let mut config = embassy_usb::Config::new(0xc0de, 0xcafe);
     config.manufacturer = Some("Embassy");
     config.product = Some("USB-serial example");
     config.serial_number = Some("12345678");
 
-    // Create embassy-usb DeviceBuilder using the driver and config.
-    // It needs some buffers for building the descriptors.
+    // Buffers for building the descriptors.
     let mut config_descriptor = [0; 256];
     let mut bos_descriptor = [0; 256];
     let mut control_buf = [0; 64];
@@ -92,46 +92,38 @@ pub async fn setup_usb<'d>(
 
     // Run the USB device.
     let usb_fut = usb.run();
-    
-    // Create the subscriber for the usb_serial
+
+    // Create the subscriber for the usb_serial.
     let mut usb_subscriber = pub_sub_channel.subscriber().unwrap();
-    
-    // Do stuff with the class!
+
+    // The echo task, which waits for a connection and then forwards sensor data.
     let echo_fut = async {
         loop {
             class.wait_connection().await;
             info!("USB Connected");
             usb_write!(
                 &mut class,
-                "time,lsm_accelx,lsm_accely,lsm_accelz,gyrox,gyroy,gyroz,\
-                pressure,temp,adxl1x,adxl1y,adxl1z,adxl2x,adxl2y,adxl2z,\
-                lis1x,lis1y,lis1z,lis2x,lis2y,lis2z\r\n");
-            
-            // Continuously poll for sensor data
+                "time,lsm_accelx,lsm_accely,lsm_accelz,gyrox,gyroy,gyroz,pressure,temp,adxl1x,adxl1y,adxl1z,adxl2x,adxl2y,adxl2z,lis1x,lis1y,lis1z,lis2x,lis2y,lis2z\r\n"
+            );
+
             loop {
-                // Check if there are any new sensor messages
                 match usb_subscriber.next_message().await {
                     WaitResult::Message(packet) => {
-                        usb_write!(&mut class, "{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}\r\n",
-                        packet.time,
-                        packet.lsm_accel.x, packet.lsm_accel.y, packet.lsm_accel.z,
-                        packet.gyro.x, packet.gyro.y, packet.gyro.z,
-                        packet.baro.pressure_mbar, packet.baro.temp_c,
-                        packet.adxl_1.x, packet.adxl_1.y, packet.adxl_1.z,
-                        packet.adxl_2.x, packet.adxl_2.y, packet.adxl_2.z,
-                        packet.lis_1.x, packet.lis_1.y, packet.lis_1.z,
-                        packet.lis_2.x, packet.lis_2.y, packet.lis_2.z,
-                    );
-                    
-                    // To test the accelerometers alone
-                    // WaitResult::Message(packet) => {
-                    //     usb_write!(&mut class, "{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}\r\n",
-                    //     packet.time,
-                    //     packet.adxl_1.x, packet.adxl_1.y, packet.adxl_1.z,
-                    //     packet.adxl_2.x, packet.adxl_2.y, packet.adxl_2.z,
-                    //     packet.lis_1.x, packet.lis_1.y, packet.lis_1.z,
-                    //     packet.lis_2.x, packet.lis_2.y, packet.lis_2.z,
-                    // );
+                        usb_write!(
+                            &mut class,
+                            "{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}\r\n",
+                            packet.time,
+                            packet.lsm_accel.x, packet.lsm_accel.y, packet.lsm_accel.z,
+                            packet.gyro.x,    packet.gyro.y,    packet.gyro.z,
+                            packet.baro.pressure_mbar, packet.baro.temp_c,
+                            packet.adxl_1.x,  packet.adxl_1.y,  packet.adxl_1.z,
+                            packet.adxl_2.x,  packet.adxl_2.y,  packet.adxl_2.z,
+                            packet.lis_1.x,   packet.lis_1.y,   packet.lis_1.z,
+                            packet.lis_2.x,   packet.lis_2.y,   packet.lis_2.z,
+                            packet.gps.status as char, packet.gps.utc_time, packet.gps.date,
+                            packet.gps.latitude, packet.gps.longitude, packet.gps.course,
+                            packet.gps.speed
+                        );
                     }
                     WaitResult::Lagged(e) => {
                         info!("USB Lagged {:?}", e);
@@ -141,29 +133,7 @@ pub async fn setup_usb<'d>(
         }
     };
 
-    // Run everything concurrently.
-    // If we had made everything `'static` above instead, we could do this using separate tasks instead.
+    // Run both the USB device and the echo task concurrently.
     join(usb_fut, echo_fut).await;
-}
-
-struct Disconnected {}
-
-impl From<EndpointError> for Disconnected {
-    fn from(val: EndpointError) -> Self {
-        match val {
-            EndpointError::BufferOverflow => panic!("Buffer overflow"),
-            EndpointError::Disabled => Disconnected {},
-        }
-    }
-}
-
-async fn echo<'d, T: Instance + 'd>(class: &mut CdcAcmClass<'d, Driver<'d, T>>) -> Result<(), Disconnected> {
-    let mut buf = [0; 64];
-    loop {
-        let n = class.read_packet(&mut buf).await?;
-        let data = &buf[..n];
-        info!("data: {:x}", data);
-        class.write_packet(data).await?;
-    }
 }
 

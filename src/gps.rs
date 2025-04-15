@@ -1,3 +1,4 @@
+use core::cell::RefCell;
 use defmt::*;
 use core::fmt::Write as _;
 use embassy_stm32::gpio::{Flex, Output, Pull};
@@ -8,35 +9,62 @@ use embassy_sync::channel::Channel;
 use embassy_time::Timer;
 use heapless::{String, Vec};
 use embassy_futures::select::{select, Either, Select};
+use embassy_sync::mutex::Mutex;
 
-pub static GPS_CHANNEL: Channel<CriticalSectionRawMutex, [u8; 256], 8> = Channel::new();
+// A static shared variable that holds the latest GPS update protected by a mutex.
+// We use CriticalSectionRawMutex because your GPS task and aggregator run on the same executor.
+pub static LATEST_GPS: Mutex<CriticalSectionRawMutex, RefCell<GpsRmc>> = Mutex::new(RefCell::new(DEFAULT_GPS_RMC));
 
 // PMTK messages
 pub const PMTK_RMC_ONLY: &str = "PMTK314,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0";  // only output RMC
 pub const PMTK_SET_POS_FIX_10HZ: &str = "PMTK220,100";  // increase output rate to 10HZ
 pub const PMTK_API_SET_FIX_CTL_10HZ: &str = "PMTK300,100,0,0,0,0";  // increase fix calculation to 10HZ
 
-#[derive(Debug)]
+#[derive(Debug, Format, Clone, Default)]
 pub struct GpsRmc {
     /// UTC time as hhmmss (fractional seconds dropped), e.g., 123519.
-    pub utc_time: Option<u32>,
+    pub utc_time: u32,
     /// Date as ddmmyy, e.g., 230394.
-    pub date: Option<u32>,
+    pub date: u32,
     /// Data validity: 'A' = valid, 'V' = invalid.
     pub status: u8,
     /// Latitude in signed decimal degrees (positive for North, negative for South).
-    pub latitude: Option<f32>,
+    pub latitude: f32,
     /// Longitude in signed decimal degrees (positive for East, negative for West).
-    pub longitude: Option<f32>,
+    pub longitude: f32,
     /// Speed over ground in knots.
-    pub speed: Option<f32>,
+    pub speed: f32,
     /// Course over ground in degrees.
-    pub course: Option<f32>,
+    pub course: f32,
 }
+// Default GPS RMC initialization values
+const DEFAULT_GPS_RMC: GpsRmc = GpsRmc {
+    utc_time: 0,
+    date: 0,
+    status: b'V',    // For example, using b'V' to indicate an invalid status.
+    latitude: 0.0,
+    longitude: 0.0,
+    speed: 0.0,
+    course: 0.0,
+};
 
-// ==============================
-// Helper Parsers (Minimal)
-// ==============================
+/// Convert a raw GPS value in ddmm.mmmm (or dddmm.mmmm) format
+/// into decimal degrees. This function handles negative values
+/// correctly by extracting the absolute value first, then reapplying the sign.
+pub fn convert_to_decimal(raw: f32) -> f32 {
+    // Work with the absolute value first
+    let raw_abs = raw.abs();
+    // For positive numbers, truncating by casting to u32 gives the floor.
+    let degrees = (raw_abs / 100.0) as u32 as f32;
+    let minutes = raw_abs - (degrees * 100.0);
+    let decimal = degrees + (minutes / 60.0);
+    // Reapply original sign: if raw was negative, make the decimal negative.
+    if raw < 0.0 {
+        -decimal
+    } else {
+        decimal
+    }
+}
 
 /// Parse the UTC time from a string of the form "hhmmss.sss".
 /// Fractional seconds are dropped; e.g. "123519.00" becomes 123519.
@@ -58,7 +86,7 @@ fn parse_date_simple(s: &str) -> Option<u32> {
 /// Parses an RMC sentence string and returns a GpsRmc struct.
 /// Returns None if the sentence is not a valid RMC sentence.
 fn parse_rmc(sentence: &str) -> Option<GpsRmc> {
-    // Remove checksum (if exists) by splitting at '*'
+    // Remove checksum (if it exists) by splitting at '*'
     let sentence_no_checksum = sentence.split('*').next()?;
 
     // Only process RMC sentences (variants may be "$GPRMC" or "$GNRMC")
@@ -67,66 +95,64 @@ fn parse_rmc(sentence: &str) -> Option<GpsRmc> {
     }
 
     // Split the sentence into its fields.
-    let parts: Vec<&str, 16> = sentence_no_checksum.split(',').collect();
+    let parts: heapless::Vec<&str, 16> = sentence_no_checksum.split(',').collect();
     if parts.len() < 12 {
         return None;
     }
 
-    // Field indices based on the RMC sentence:
-    // 0: Header, 1: UTC time, 2: Status, 3: Latitude, 4: N/S,
-    // 5: Longitude, 6: E/W, 7: Speed, 8: Course, 9: Date, 
-    // (fields 10 and 11 are magnetic variation info and are ignored)
-
+    // Process each field, using default values if needed:
     let utc_time = if !parts[1].is_empty() {
-        parse_time_simple(parts[1])
+        parse_time_simple(parts[1]).unwrap_or_default()
     } else {
-        None
+        0
     };
 
     let status = parts[2].bytes().next().unwrap_or(b'V');
 
-    // Process latitude: parse and then convert to a signed coordinate.
-    let latitude = if !parts[3].is_empty() {
-        parts[3].parse::<f32>().ok().map(|lat| {
-            if let Some(dir) = parts[4].chars().next() {
-                if dir == 'S' { -lat } else { lat }
-            } else {
-                lat
-            }
-        })
+    // Convert latitude:
+    let latitude_raw = if !parts[3].is_empty() {
+        parts[3].parse::<f32>().ok().unwrap_or_default()
     } else {
-        None
+        0.0
     };
 
-    // Process longitude: parse and apply sign based on direction.
-    let longitude = if !parts[5].is_empty() {
-        parts[5].parse::<f32>().ok().map(|lon| {
-            if let Some(dir) = parts[6].chars().next() {
-                if dir == 'W' { -lon } else { lon }
-            } else {
-                lon
-            }
-        })
+    let latitude = if let Some(dir) = parts[4].chars().next() {
+        let conv = convert_to_decimal(latitude_raw);
+        if dir == 'S' { -conv } else { conv }
     } else {
-        None
+        0.0
+    };
+
+    // Convert longitude:
+    let longitude_raw = if !parts[5].is_empty() {
+        parts[5].parse::<f32>().ok().unwrap_or_default()
+    } else {
+        0.0
+    };
+
+    let longitude = if let Some(dir) = parts[6].chars().next() {
+        let conv = convert_to_decimal(longitude_raw);
+        if dir == 'W' { -conv } else { conv }
+    } else {
+        0.0
     };
 
     let speed = if !parts[7].is_empty() {
-        parts[7].parse::<f32>().ok()
+        parts[7].parse::<f32>().ok().unwrap_or_default()
     } else {
-        None
+        0.0
     };
 
     let course = if !parts[8].is_empty() {
-        parts[8].parse::<f32>().ok()
+        parts[8].parse::<f32>().ok().unwrap_or_default()
     } else {
-        None
+        0.0
     };
 
     let date = if !parts[9].is_empty() {
-        parse_date_simple(parts[9])
+        parse_date_simple(parts[9]).unwrap_or_default()
     } else {
-        None
+        0
     };
 
     Some(GpsRmc {
@@ -141,20 +167,33 @@ fn parse_rmc(sentence: &str) -> Option<GpsRmc> {
 }
 
 #[embassy_executor::task]
-pub async fn gps_reader(mut rx: UartRx<'static, Async>) {
-
+pub async fn gps_reader(
+    mut rx: UartRx<'static, Async>
+) {
     let mut buf = [0u8; 128];
-    let mut line = Vec::<u8, 512>::new(); // Heapless buffer to accumulate NMEA burst
+    // Heapless buffer to accumulate NMEA data.
+    let mut line = Vec::<u8, 512>::new();
 
     loop {
         match rx.read_until_idle(&mut buf).await {
             Ok(n) => {
                 for &byte in &buf[..n] {
-                    // Accumulate until newline
-                    line.push(byte).ok();
+                    if line.push(byte).is_err() {
+                        line.clear();
+                        warn!("GPS buffer overflow - clearing data");
+                    }
                     if byte == b'\n' {
-                        if let Ok(s) = core::str::from_utf8(&line) {
-                            info!("GPS RX: {}", s.trim_end());
+                        if let Ok(sentence) = str::from_utf8(&line) {
+                            let trimmed = sentence.trim_end();
+                            info!("GPS RX: {}", trimmed);
+                            if let Some(rmc) = parse_rmc(trimmed) {
+                                info!("Parsed RMC: {:?}", rmc);
+                                // Update the shared latest GPS data.
+                                let gps_lock = LATEST_GPS.lock().await;
+                                *gps_lock.borrow_mut() = rmc;
+                            } else {
+                                warn!("Received non-RMC or invalid sentence");
+                            }
                         } else {
                             warn!("GPS RX: Invalid UTF-8");
                         }
@@ -164,7 +203,7 @@ pub async fn gps_reader(mut rx: UartRx<'static, Async>) {
             }
             Err(e) => {
                 warn!("GPS RX error: {:?}", e);
-                line.clear(); // Drop partial data on error
+                line.clear();
             }
         }
     }
