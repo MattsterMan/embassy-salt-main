@@ -548,7 +548,7 @@ pub async fn ms5611_task(mut i2c: I2cDevice<'static, NoopRawMutex, I2c<'static, 
     loop {
         // read temperature and pressure data
         // osr of 2048 => ~110 Hz, 1024 => ~218 Hz
-        match read_sample(&mut i2c, &prom_data, Osr::Opt2048).await {
+        match read_sample(&mut i2c, &prom_data, Osr::Opt512).await {
             Ok(sample) => {
                 info!(
                     "MS5611: Temp = {} °C, Pressure = {} mbar",
@@ -563,7 +563,7 @@ pub async fn ms5611_task(mut i2c: I2cDevice<'static, NoopRawMutex, I2c<'static, 
             }
         }
         
-        Timer::after_millis(WAIT_TIME).await;
+        //Timer::after_millis(WAIT_TIME).await;
     }
 }
 

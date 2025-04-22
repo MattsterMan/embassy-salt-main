@@ -103,7 +103,7 @@ pub async fn usb_task(
             info!("USB Connected");
             usb_write!(
                 &mut class,
-                "time,lsm_accelx,lsm_accely,lsm_accelz,gyrox,gyroy,gyroz,pressure,temp,adxl1x,adxl1y,adxl1z,adxl2x,adxl2y,adxl2z,lis1x,lis1y,lis1z,lis2x,lis2y,lis2z\r\n"
+                "time,lsm_accelx,lsm_accely,lsm_accelz,gyrox,gyroy,gyroz,pressure,temp,adxl1x,adxl1y,adxl1z,adxl2x,adxl2y,adxl2z,lis1x,lis1y,lis1z,lis2x,lis2y,lis2z,status,utc_time,date,lat,lon,course,speed\r\n"
             );
 
             loop {

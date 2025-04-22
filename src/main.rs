@@ -160,15 +160,15 @@ async fn main(spawner: Spawner) {
     let i2c_lis3dh_1 = I2cDevice::new(i2c_bus);
     let i2c_lis3dh_2 = I2cDevice::new(i2c_bus);
 
-    // spawner.spawn(lsm6dsox_task(i2c_lsm6dsox)).unwrap();
-    // spawner.spawn(iis2mdctr_task(i2c_iis2mdctr)).unwrap();
-    // spawner.spawn(ms5611_task(i2c_ms5611)).unwrap();
+    spawner.spawn(lsm6dsox_task(i2c_lsm6dsox)).unwrap();
+    spawner.spawn(iis2mdctr_task(i2c_iis2mdctr)).unwrap();
+    spawner.spawn(ms5611_task(i2c_ms5611)).unwrap();
     
     // Comment below if unplugged
-    // spawner.spawn(adxl375_task(i2c_adxl375_1, ADXL375_LOW_ADDRESS)).unwrap();
-    // spawner.spawn(adxl375_task(i2c_adxl375_2, ADXL375_HIGH_ADDRESS)).unwrap();
-    // spawner.spawn(lis3dh_task(i2c_lis3dh_1, LIS3DH_LOW_ADDRESS)).unwrap();
-    // spawner.spawn(lis3dh_task(i2c_lis3dh_2, LIS3DH_HIGH_ADDRESS)).unwrap();
+    spawner.spawn(adxl375_task(i2c_adxl375_1, ADXL375_LOW_ADDRESS)).unwrap();
+    spawner.spawn(adxl375_task(i2c_adxl375_2, ADXL375_HIGH_ADDRESS)).unwrap();
+    spawner.spawn(lis3dh_task(i2c_lis3dh_1, LIS3DH_LOW_ADDRESS)).unwrap();
+    spawner.spawn(lis3dh_task(i2c_lis3dh_2, LIS3DH_HIGH_ADDRESS)).unwrap();
     
     spawner.spawn(aggregator_task()).unwrap();
     spawner.spawn(usb_task(p.USB, p.PA12, p.PA11, &SENSOR_PUBSUB)).unwrap();
@@ -235,10 +235,10 @@ async fn aggregator_task() {
         try_receive_to(&MS5611_CHANNEL, &mut data_packet.baro, "MS5611");
 
         // Comment below if unplugged
-        // try_receive_to(&ADXL375_1_CHANNEL, &mut data_packet.adxl_1, "ADXL1");
-        // try_receive_to(&ADXL375_2_CHANNEL, &mut data_packet.adxl_2, "ADXL2");
-        // try_receive_to(&LIS3DH_1_CHANNEL, &mut data_packet.lis_1, "LIS1");
-        // try_receive_to(&LIS3DH_2_CHANNEL, &mut data_packet.lis_2, "LIS2");
+        try_receive_to(&ADXL375_1_CHANNEL, &mut data_packet.adxl_1, "ADXL1");
+        try_receive_to(&ADXL375_2_CHANNEL, &mut data_packet.adxl_2, "ADXL2");
+        try_receive_to(&LIS3DH_1_CHANNEL, &mut data_packet.lis_1, "LIS1");
+        try_receive_to(&LIS3DH_2_CHANNEL, &mut data_packet.lis_2, "LIS2");
         
         info!("Mag Data (gauss): X = {}, Y = {}, Z = {}", data_packet.mag.x, data_packet.mag.y, data_packet.mag.z);
 
