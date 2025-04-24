@@ -10,6 +10,7 @@ use embassy_time::Timer;
 use heapless::{String, Vec};
 use embassy_futures::select::{select, Either, Select};
 use embassy_sync::mutex::Mutex;
+use serde::{Deserialize, Serialize};
 
 // A static shared variable that holds the latest GPS update protected by a mutex.
 // We use CriticalSectionRawMutex because your GPS task and aggregator run on the same executor.
@@ -20,7 +21,7 @@ pub const PMTK_RMC_ONLY: &str = "PMTK314,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0";
 pub const PMTK_SET_POS_FIX_10HZ: &str = "PMTK220,100";  // increase output rate to 10HZ
 pub const PMTK_API_SET_FIX_CTL_10HZ: &str = "PMTK300,100,0,0,0,0";  // increase fix calculation to 10HZ
 
-#[derive(Debug, Format, Clone, Default)]
+#[derive(Debug, Format, Clone, Default, Serialize, Deserialize)]
 pub struct GpsRmc {
     /// UTC time as hhmmss (fractional seconds dropped), e.g., 123519.
     pub utc_time: u32,

@@ -6,6 +6,7 @@ use embassy_stm32::mode::Async;
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::channel::Channel;
 use embassy_time::{Timer, Duration};
+use serde::{Deserialize, Serialize};
 use {defmt_rtt as _, panic_probe as _};
 use crate::adxl375::*;
 use crate::iis2mdctr::*;
@@ -19,21 +20,21 @@ pub const SENSOR_CHANNEL_CAPACITY: usize = 8;
 // millisecond wait for sensor tasks
 const WAIT_TIME: u64 = 5;
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct AccelData{
     pub x: f32,
     pub y: f32,
     pub z: f32,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct GyroData{
     pub x: f32,
     pub y: f32,
     pub z: f32,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct MagData{
     pub x: f32,
     pub y: f32,

@@ -5,6 +5,7 @@ use embassy_stm32::i2c::I2c;
 use embassy_stm32::mode::Async;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_time::Timer;
+use serde::{Deserialize, Serialize};
 
 // address
 pub const MS5611_ADDRESS: u8 = 0x77;  // when CSB is low
@@ -65,7 +66,7 @@ impl Osr {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Ms5611Sample {
     // pressure measured in millibars
     pub pressure_mbar: f32,

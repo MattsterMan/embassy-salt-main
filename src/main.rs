@@ -10,6 +10,7 @@ mod lis3dh;
 mod iis2mdctr;
 mod ms5611;
 mod gps;
+mod can_tx;
 
 use core::cell::RefCell;
 use defmt::*;
@@ -32,16 +33,15 @@ use crate::adxl375::{ADXL375_LOW_ADDRESS, ADXL375_HIGH_ADDRESS};
 use crate::gps::*;
 use crate::lis3dh::{LIS3DH_HIGH_ADDRESS, LIS3DH_LOW_ADDRESS};
 use crate::ms5611::Ms5611Sample;
-// Sensors
 use crate::sensors::*;
-
-// USB
 use crate::usb_serial::*;
+use serde::{Serialize, Deserialize};
+use crate::can_tx::can_tx_task;
 
 static I2C_BUS: StaticCell<NoopMutex<RefCell<I2c<'static, Async>>>> = StaticCell::new();
 
 // Combine all sensor data into one struct for packetization
-#[derive(Clone)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct SensorPacket {
     pub time: u64,
     pub lsm_accel: AccelData,
@@ -107,7 +107,7 @@ async fn main(spawner: Spawner) {
     let mut can = can::CanConfigurator::new(p.FDCAN1, p.PD0, p.PD1, CanIrqs);
 
     can.set_bitrate(250_000);
-
+    
     let mut can = can.into_normal_mode();
 
     // Set up user led as output
@@ -164,41 +164,23 @@ async fn main(spawner: Spawner) {
     spawner.spawn(iis2mdctr_task(i2c_iis2mdctr)).unwrap();
     spawner.spawn(ms5611_task(i2c_ms5611)).unwrap();
     
-    // Comment below if unplugged
-    spawner.spawn(adxl375_task(i2c_adxl375_1, ADXL375_LOW_ADDRESS)).unwrap();
-    spawner.spawn(adxl375_task(i2c_adxl375_2, ADXL375_HIGH_ADDRESS)).unwrap();
-    spawner.spawn(lis3dh_task(i2c_lis3dh_1, LIS3DH_LOW_ADDRESS)).unwrap();
-    spawner.spawn(lis3dh_task(i2c_lis3dh_2, LIS3DH_HIGH_ADDRESS)).unwrap();
+    // // Comment below if unplugged
+    // spawner.spawn(adxl375_task(i2c_adxl375_1, ADXL375_LOW_ADDRESS)).unwrap();
+    // spawner.spawn(adxl375_task(i2c_adxl375_2, ADXL375_HIGH_ADDRESS)).unwrap();
+    // spawner.spawn(lis3dh_task(i2c_lis3dh_1, LIS3DH_LOW_ADDRESS)).unwrap();
+    // spawner.spawn(lis3dh_task(i2c_lis3dh_2, LIS3DH_HIGH_ADDRESS)).unwrap();
     
-    spawner.spawn(aggregator_task()).unwrap();
-    spawner.spawn(usb_task(p.USB, p.PA12, p.PA11, &SENSOR_PUBSUB)).unwrap();
-    
-    let mut last_read_ts = embassy_time::Instant::now();
+    spawner.spawn(aggregator_task()).unwrap();  // sensor data aggregation
+    spawner.spawn(usb_task(p.USB, p.PA12, p.PA11, &SENSOR_PUBSUB)).unwrap();  // USB
+    // Take ownership of TX side
+    let (can_tx, _can_rx, _props) = can.split();
+    spawner.spawn(can_tx_task(can_tx)).unwrap();
 
     loop {
-        // can example
         led.set_high();
-        
-        // match can.read().await {
-        //     Ok(envelope) => {
-        //         let (rx_frame, ts) = envelope.parts();
-        //         let delta = (ts - last_read_ts).as_millis();
-        //         last_read_ts = ts;
-        //         info!(
-        //             "Rx: {:x} {:x} {:x} {:x} --- NEW {}",
-        //             rx_frame.data()[0],
-        //             rx_frame.data()[1],
-        //             rx_frame.data()[2],
-        //             rx_frame.data()[3],
-        //             delta,
-        //         )
-        //     }
-        //     Err(_err) => error!("Error in frame"),
-        // }
-
-        Timer::after_millis(250).await;
+        Timer::after_millis(500).await;
         led.set_low();
-        Timer::after_millis(250).await;
+        Timer::after_millis(500).await;
     }
 }
 
@@ -234,11 +216,11 @@ async fn aggregator_task() {
         try_receive_to(&IIS2MDCTR_CHANNEL, &mut data_packet.mag, "IIS2");
         try_receive_to(&MS5611_CHANNEL, &mut data_packet.baro, "MS5611");
 
-        // Comment below if unplugged
-        try_receive_to(&ADXL375_1_CHANNEL, &mut data_packet.adxl_1, "ADXL1");
-        try_receive_to(&ADXL375_2_CHANNEL, &mut data_packet.adxl_2, "ADXL2");
-        try_receive_to(&LIS3DH_1_CHANNEL, &mut data_packet.lis_1, "LIS1");
-        try_receive_to(&LIS3DH_2_CHANNEL, &mut data_packet.lis_2, "LIS2");
+        // // Comment below if unplugged
+        // try_receive_to(&ADXL375_1_CHANNEL, &mut data_packet.adxl_1, "ADXL1");
+        // try_receive_to(&ADXL375_2_CHANNEL, &mut data_packet.adxl_2, "ADXL2");
+        // try_receive_to(&LIS3DH_1_CHANNEL, &mut data_packet.lis_1, "LIS1");
+        // try_receive_to(&LIS3DH_2_CHANNEL, &mut data_packet.lis_2, "LIS2");
         
         info!("Mag Data (gauss): X = {}, Y = {}, Z = {}", data_packet.mag.x, data_packet.mag.y, data_packet.mag.z);
 
